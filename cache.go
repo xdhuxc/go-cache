@@ -11,8 +11,8 @@ import (
 )
 
 type Item struct {
-	Object     interface{}
-	Expiration int64
+	Object     interface{} `json:"object"`
+	Expiration int64       `json:"expiration"`
 }
 
 // Returns true if the item has expired.
@@ -20,6 +20,7 @@ func (item Item) Expired() bool {
 	if item.Expiration == 0 {
 		return false
 	}
+
 	return time.Now().UnixNano() > item.Expiration
 }
 
@@ -38,100 +39,106 @@ type Cache struct {
 }
 
 type cache struct {
-	defaultExpiration time.Duration
-	items             map[string]Item
-	mu                sync.RWMutex
-	onEvicted         func(string, interface{})
-	janitor           *janitor
+	// global default expiration
+	expiration time.Duration
+	items      map[string]Item
+	mutex      sync.RWMutex
+	onEvicted  func(string, interface{})
+	janitor    *janitor
 }
 
 // Add an item to the cache, replacing any existing item. If the duration is 0
 // (DefaultExpiration), the cache's default expiration time is used. If it is -1
 // (NoExpiration), the item never expires.
-func (c *cache) Set(k string, x interface{}, d time.Duration) {
+func (c *cache) Set(key string, value interface{}, duration time.Duration) {
 	// "Inlining" of set
-	var e int64
-	if d == DefaultExpiration {
-		d = c.defaultExpiration
+	var expiration int64
+	if duration == DefaultExpiration {
+		duration = c.expiration
 	}
-	if d > 0 {
-		e = time.Now().Add(d).UnixNano()
+	if duration > 0 {
+		expiration = time.Now().Add(duration).UnixNano()
 	}
-	c.mu.Lock()
-	c.items[k] = Item{
-		Object:     x,
-		Expiration: e,
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.items[key] = Item{
+		Object:     value,
+		Expiration: expiration,
 	}
-	// TODO: Calls to mu.Unlock are currently not deferred because defer
-	// adds ~200 ns (as of go1.)
-	c.mu.Unlock()
 }
 
-func (c *cache) set(k string, x interface{}, d time.Duration) {
-	var e int64
-	if d == DefaultExpiration {
-		d = c.defaultExpiration
+func (c *cache) set(key string, value interface{}, duration time.Duration) {
+	var expiration int64
+	if duration == DefaultExpiration {
+		duration = c.expiration
 	}
-	if d > 0 {
-		e = time.Now().Add(d).UnixNano()
+	if duration > 0 {
+		expiration = time.Now().Add(duration).UnixNano()
 	}
-	c.items[k] = Item{
-		Object:     x,
-		Expiration: e,
+
+	c.items[key] = Item{
+		Object:     value,
+		Expiration: expiration,
 	}
 }
 
 // Add an item to the cache, replacing any existing item, using the default
 // expiration.
-func (c *cache) SetDefault(k string, x interface{}) {
-	c.Set(k, x, DefaultExpiration)
+func (c *cache) SetDefault(key string, value interface{}) {
+	c.Set(key, value, DefaultExpiration)
 }
 
 // Add an item to the cache only if an item doesn't already exist for the given
 // key, or if the existing item has expired. Returns an error otherwise.
-func (c *cache) Add(k string, x interface{}, d time.Duration) error {
-	c.mu.Lock()
-	_, found := c.get(k)
+func (c *cache) Add(key string, value interface{}, duration time.Duration) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	_, found := c.get(key)
 	if found {
-		c.mu.Unlock()
-		return fmt.Errorf("Item %s already exists", k)
+		return fmt.Errorf("item %s already exists", key)
 	}
-	c.set(k, x, d)
-	c.mu.Unlock()
+
+	c.set(key, value, duration)
+
 	return nil
 }
 
 // Set a new value for the cache key only if it already exists, and the existing
 // item hasn't expired. Returns an error otherwise.
-func (c *cache) Replace(k string, x interface{}, d time.Duration) error {
-	c.mu.Lock()
-	_, found := c.get(k)
+func (c *cache) Replace(key string, value interface{}, duration time.Duration) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	_, found := c.get(key)
 	if !found {
-		c.mu.Unlock()
-		return fmt.Errorf("Item %s doesn't exist", k)
+		return fmt.Errorf("item %s doesn't exist", key)
 	}
-	c.set(k, x, d)
-	c.mu.Unlock()
+
+	c.set(key, value, duration)
+
 	return nil
 }
 
 // Get an item from the cache. Returns the item or nil, and a bool indicating
 // whether the key was found.
-func (c *cache) Get(k string) (interface{}, bool) {
-	c.mu.RLock()
+func (c *cache) Get(key string) (interface{}, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	// "Inlining" of get and Expired
-	item, found := c.items[k]
+	item, found := c.items[key]
 	if !found {
-		c.mu.RUnlock()
 		return nil, false
 	}
 	if item.Expiration > 0 {
 		if time.Now().UnixNano() > item.Expiration {
-			c.mu.RUnlock()
 			return nil, false
 		}
 	}
-	c.mu.RUnlock()
+
 	return item.Object, true
 }
 
@@ -139,34 +146,30 @@ func (c *cache) Get(k string) (interface{}, bool) {
 // It returns the item or nil, the expiration time if one is set (if the item
 // never expires a zero value for time.Time is returned), and a bool indicating
 // whether the key was found.
-func (c *cache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
-	c.mu.RLock()
+func (c *cache) GetWithExpiration(key string) (interface{}, time.Time, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	// "Inlining" of get and Expired
-	item, found := c.items[k]
+	item, found := c.items[key]
 	if !found {
-		c.mu.RUnlock()
 		return nil, time.Time{}, false
 	}
-
 	if item.Expiration > 0 {
 		if time.Now().UnixNano() > item.Expiration {
-			c.mu.RUnlock()
 			return nil, time.Time{}, false
 		}
-
 		// Return the item and the expiration time
-		c.mu.RUnlock()
 		return item.Object, time.Unix(0, item.Expiration), true
 	}
 
 	// If expiration <= 0 (i.e. no expiration time set) then return the item
 	// and a zeroed time.Time
-	c.mu.RUnlock()
 	return item.Object, time.Time{}, true
 }
 
-func (c *cache) get(k string) (interface{}, bool) {
-	item, found := c.items[k]
+func (c *cache) get(key string) (interface{}, bool) {
+	item, found := c.items[key]
 	if !found {
 		return nil, false
 	}
@@ -184,46 +187,48 @@ func (c *cache) get(k string) (interface{}, bool) {
 // item's value is not an integer, if it was not found, or if it is not
 // possible to increment it by n. To retrieve the incremented value, use one
 // of the specialized methods, e.g. IncrementInt64.
-func (c *cache) Increment(k string, n int64) error {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return fmt.Errorf("Item %s not found", k)
+func (c *cache) Increment(key string, n int64) error {
+	c.mutex.Lock()
+	c.mutex.RUnlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		c.mutex.Unlock()
+		return fmt.Errorf("item %s not found", key)
 	}
-	switch v.Object.(type) {
+
+	switch value.Object.(type) {
 	case int:
-		v.Object = v.Object.(int) + int(n)
+		value.Object = value.Object.(int) + int(n)
 	case int8:
-		v.Object = v.Object.(int8) + int8(n)
+		value.Object = value.Object.(int8) + int8(n)
 	case int16:
-		v.Object = v.Object.(int16) + int16(n)
+		value.Object = value.Object.(int16) + int16(n)
 	case int32:
-		v.Object = v.Object.(int32) + int32(n)
+		value.Object = value.Object.(int32) + int32(n)
 	case int64:
-		v.Object = v.Object.(int64) + n
+		value.Object = value.Object.(int64) + n
 	case uint:
-		v.Object = v.Object.(uint) + uint(n)
+		value.Object = value.Object.(uint) + uint(n)
 	case uintptr:
-		v.Object = v.Object.(uintptr) + uintptr(n)
+		value.Object = value.Object.(uintptr) + uintptr(n)
 	case uint8:
-		v.Object = v.Object.(uint8) + uint8(n)
+		value.Object = value.Object.(uint8) + uint8(n)
 	case uint16:
-		v.Object = v.Object.(uint16) + uint16(n)
+		value.Object = value.Object.(uint16) + uint16(n)
 	case uint32:
-		v.Object = v.Object.(uint32) + uint32(n)
+		value.Object = value.Object.(uint32) + uint32(n)
 	case uint64:
-		v.Object = v.Object.(uint64) + uint64(n)
+		value.Object = value.Object.(uint64) + uint64(n)
 	case float32:
-		v.Object = v.Object.(float32) + float32(n)
+		value.Object = value.Object.(float32) + float32(n)
 	case float64:
-		v.Object = v.Object.(float64) + float64(n)
+		value.Object = value.Object.(float64) + float64(n)
 	default:
-		c.mu.Unlock()
-		return fmt.Errorf("The value for %s is not an integer", k)
+		return fmt.Errorf("the value for %s is not an integer", key)
 	}
-	c.items[k] = v
-	c.mu.Unlock()
+	c.items[key] = value
+
 	return nil
 }
 
@@ -232,310 +237,310 @@ func (c *cache) Increment(k string, n int64) error {
 // possible to increment it by n. Pass a negative number to decrement the
 // value. To retrieve the incremented value, use one of the specialized methods,
 // e.g. IncrementFloat64.
-func (c *cache) IncrementFloat(k string, n float64) error {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementFloat(key string, n float64) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return fmt.Errorf("item %s not found", key)
 	}
-	switch v.Object.(type) {
+	switch value.Object.(type) {
 	case float32:
-		v.Object = v.Object.(float32) + float32(n)
+		value.Object = value.Object.(float32) + float32(n)
 	case float64:
-		v.Object = v.Object.(float64) + n
+		value.Object = value.Object.(float64) + n
 	default:
-		c.mu.Unlock()
-		return fmt.Errorf("The value for %s does not have type float32 or float64", k)
+		return fmt.Errorf("the value for %s does not have type float32 or float64", key)
 	}
-	c.items[k] = v
-	c.mu.Unlock()
+	c.items[key] = value
+
 	return nil
 }
 
 // Increment an item of type int by n. Returns an error if the item's value is
 // not an int, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementInt(k string, n int) (int, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementInt(key string, n int) (int, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int)
+	rv, ok := value.Object.(int)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int", k)
+		return 0, fmt.Errorf("the value for %s is not an int", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type int8 by n. Returns an error if the item's value is
 // not an int8, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementInt8(k string, n int8) (int8, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementInt8(key string, n int8) (int8, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int8)
+	rv, ok := value.Object.(int8)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int8", k)
+		return 0, fmt.Errorf("the value for %s is not an int8", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type int16 by n. Returns an error if the item's value is
 // not an int16, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementInt16(k string, n int16) (int16, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementInt16(key string, n int16) (int16, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int16)
+	rv, ok := value.Object.(int16)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int16", k)
+		return 0, fmt.Errorf("the value for %s is not an int16", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type int32 by n. Returns an error if the item's value is
 // not an int32, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementInt32(k string, n int32) (int32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementInt32(key string, n int32) (int32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int32)
+	rv, ok := value.Object.(int32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int32", k)
+		return 0, fmt.Errorf("the value for %s is not an int32", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type int64 by n. Returns an error if the item's value is
 // not an int64, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementInt64(k string, n int64) (int64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementInt64(key string, n int64) (int64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int64)
+	rv, ok := value.Object.(int64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int64", k)
+		return 0, fmt.Errorf("the value for %s is not an int64", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uint by n. Returns an error if the item's value is
 // not an uint, or if it was not found. If there is no error, the incremented
 // value is returned.
-func (c *cache) IncrementUint(k string, n uint) (uint, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUint(key string, n uint) (uint, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint)
+	rv, ok := value.Object.(uint)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint", k)
+		return 0, fmt.Errorf("the value for %s is not an uint", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uintptr by n. Returns an error if the item's value
 // is not an uintptr, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementUintptr(k string, n uintptr) (uintptr, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUintptr(key string, n uintptr) (uintptr, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uintptr)
+	rv, ok := value.Object.(uintptr)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uintptr", k)
+		return 0, fmt.Errorf("the value for %s is not an uintptr", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uint8 by n. Returns an error if the item's value
 // is not an uint8, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementUint8(k string, n uint8) (uint8, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUint8(key string, n uint8) (uint8, error) {
+	c.mutex.Lock()
+	c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint8)
+	rv, ok := value.Object.(uint8)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint8", k)
+		return 0, fmt.Errorf("the value for %s is not an uint8", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uint16 by n. Returns an error if the item's value
 // is not an uint16, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementUint16(k string, n uint16) (uint16, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUint16(key string, n uint16) (uint16, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint16)
+	rv, ok := value.Object.(uint16)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint16", k)
+		return 0, fmt.Errorf("the value for %s is not an uint16", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uint32 by n. Returns an error if the item's value
 // is not an uint32, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementUint32(k string, n uint32) (uint32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUint32(key string, n uint32) (uint32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint32)
+	rv, ok := value.Object.(uint32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint32", k)
+		return 0, fmt.Errorf("the value for %s is not an uint32", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type uint64 by n. Returns an error if the item's value
 // is not an uint64, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementUint64(k string, n uint64) (uint64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementUint64(key string, n uint64) (uint64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint64)
+	rv, ok := value.Object.(uint64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint64", k)
+		return 0, fmt.Errorf("the value for %s is not an uint64", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type float32 by n. Returns an error if the item's value
 // is not an float32, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementFloat32(k string, n float32) (float32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementFloat32(key string, n float32) (float32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(float32)
+	rv, ok := value.Object.(float32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an float32", k)
+		return 0, fmt.Errorf("the value for %s is not an float32", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Increment an item of type float64 by n. Returns an error if the item's value
 // is not an float64, or if it was not found. If there is no error, the
 // incremented value is returned.
-func (c *cache) IncrementFloat64(k string, n float64) (float64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) IncrementFloat64(key string, n float64) (float64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(float64)
+	rv, ok := value.Object.(float64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an float64", k)
+		return 0, fmt.Errorf("the value for %s is not an float64", key)
 	}
 	nv := rv + n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
@@ -544,48 +549,48 @@ func (c *cache) IncrementFloat64(k string, n float64) (float64, error) {
 // item's value is not an integer, if it was not found, or if it is not
 // possible to decrement it by n. To retrieve the decremented value, use one
 // of the specialized methods, e.g. DecrementInt64.
-func (c *cache) Decrement(k string, n int64) error {
+func (c *cache) Decrement(key string, n int64) error {
 	// TODO: Implement Increment and Decrement more cleanly.
-	// (Cannot do Increment(k, n*-1) for uints.)
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return fmt.Errorf("Item not found")
+	// (Cannot do Increment(key, n*-1) for uints.)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return fmt.Errorf("item %s not found", key)
 	}
-	switch v.Object.(type) {
+	switch value.Object.(type) {
 	case int:
-		v.Object = v.Object.(int) - int(n)
+		value.Object = value.Object.(int) - int(n)
 	case int8:
-		v.Object = v.Object.(int8) - int8(n)
+		value.Object = value.Object.(int8) - int8(n)
 	case int16:
-		v.Object = v.Object.(int16) - int16(n)
+		value.Object = value.Object.(int16) - int16(n)
 	case int32:
-		v.Object = v.Object.(int32) - int32(n)
+		value.Object = value.Object.(int32) - int32(n)
 	case int64:
-		v.Object = v.Object.(int64) - n
+		value.Object = value.Object.(int64) - n
 	case uint:
-		v.Object = v.Object.(uint) - uint(n)
+		value.Object = value.Object.(uint) - uint(n)
 	case uintptr:
-		v.Object = v.Object.(uintptr) - uintptr(n)
+		value.Object = value.Object.(uintptr) - uintptr(n)
 	case uint8:
-		v.Object = v.Object.(uint8) - uint8(n)
+		value.Object = value.Object.(uint8) - uint8(n)
 	case uint16:
-		v.Object = v.Object.(uint16) - uint16(n)
+		value.Object = value.Object.(uint16) - uint16(n)
 	case uint32:
-		v.Object = v.Object.(uint32) - uint32(n)
+		value.Object = value.Object.(uint32) - uint32(n)
 	case uint64:
-		v.Object = v.Object.(uint64) - uint64(n)
+		value.Object = value.Object.(uint64) - uint64(n)
 	case float32:
-		v.Object = v.Object.(float32) - float32(n)
+		value.Object = value.Object.(float32) - float32(n)
 	case float64:
-		v.Object = v.Object.(float64) - float64(n)
+		value.Object = value.Object.(float64) - float64(n)
 	default:
-		c.mu.Unlock()
-		return fmt.Errorf("The value for %s is not an integer", k)
+		return fmt.Errorf("the value for %s is not an integer", key)
 	}
-	c.items[k] = v
-	c.mu.Unlock()
+	c.items[key] = value
+
 	return nil
 }
 
@@ -594,331 +599,334 @@ func (c *cache) Decrement(k string, n int64) error {
 // possible to decrement it by n. Pass a negative number to decrement the
 // value. To retrieve the decremented value, use one of the specialized methods,
 // e.g. DecrementFloat64.
-func (c *cache) DecrementFloat(k string, n float64) error {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementFloat(key string, n float64) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return fmt.Errorf("item %s not found", key)
 	}
-	switch v.Object.(type) {
+	switch value.Object.(type) {
 	case float32:
-		v.Object = v.Object.(float32) - float32(n)
+		value.Object = value.Object.(float32) - float32(n)
 	case float64:
-		v.Object = v.Object.(float64) - n
+		value.Object = value.Object.(float64) - n
 	default:
-		c.mu.Unlock()
-		return fmt.Errorf("The value for %s does not have type float32 or float64", k)
+		return fmt.Errorf("the value for %s does not have type float32 or float64", key)
 	}
-	c.items[k] = v
-	c.mu.Unlock()
+	c.items[key] = value
+
 	return nil
 }
 
 // Decrement an item of type int by n. Returns an error if the item's value is
 // not an int, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementInt(k string, n int) (int, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementInt(key string, n int) (int, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int)
+	rv, ok := value.Object.(int)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int", k)
+		return 0, fmt.Errorf("the value for %s is not an int", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type int8 by n. Returns an error if the item's value is
 // not an int8, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementInt8(k string, n int8) (int8, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementInt8(key string, n int8) (int8, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int8)
+	rv, ok := value.Object.(int8)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int8", k)
+		return 0, fmt.Errorf("the value for %s is not an int8", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type int16 by n. Returns an error if the item's value is
 // not an int16, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementInt16(k string, n int16) (int16, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementInt16(key string, n int16) (int16, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int16)
+	rv, ok := value.Object.(int16)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int16", k)
+		return 0, fmt.Errorf("the value for %s is not an int16", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type int32 by n. Returns an error if the item's value is
 // not an int32, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementInt32(k string, n int32) (int32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementInt32(key string, n int32) (int32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int32)
+	rv, ok := value.Object.(int32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int32", k)
+		return 0, fmt.Errorf("the value for %s is not an int32", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type int64 by n. Returns an error if the item's value is
 // not an int64, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementInt64(k string, n int64) (int64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementInt64(key string, n int64) (int64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(int64)
+	rv, ok := value.Object.(int64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an int64", k)
+		return 0, fmt.Errorf("the value for %s is not an int64", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uint by n. Returns an error if the item's value is
 // not an uint, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementUint(k string, n uint) (uint, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUint(key string, n uint) (uint, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint)
+	rv, ok := value.Object.(uint)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint", k)
+		return 0, fmt.Errorf("the value for %s is not an uint", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uintptr by n. Returns an error if the item's value
 // is not an uintptr, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementUintptr(k string, n uintptr) (uintptr, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUintptr(key string, n uintptr) (uintptr, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uintptr)
+	rv, ok := value.Object.(uintptr)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uintptr", k)
+		return 0, fmt.Errorf("the value for %s is not an uintptr", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uint8 by n. Returns an error if the item's value is
 // not an uint8, or if it was not found. If there is no error, the decremented
 // value is returned.
-func (c *cache) DecrementUint8(k string, n uint8) (uint8, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUint8(key string, n uint8) (uint8, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint8)
+	rv, ok := value.Object.(uint8)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint8", k)
+		return 0, fmt.Errorf("the value for %s is not an uint8", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uint16 by n. Returns an error if the item's value
 // is not an uint16, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementUint16(k string, n uint16) (uint16, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUint16(key string, n uint16) (uint16, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint16)
+	rv, ok := value.Object.(uint16)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint16", k)
+		return 0, fmt.Errorf("the value for %s is not an uint16", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uint32 by n. Returns an error if the item's value
 // is not an uint32, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementUint32(k string, n uint32) (uint32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUint32(key string, n uint32) (uint32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint32)
+	rv, ok := value.Object.(uint32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint32", k)
+		return 0, fmt.Errorf("the value for %s is not an uint32", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type uint64 by n. Returns an error if the item's value
 // is not an uint64, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementUint64(k string, n uint64) (uint64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementUint64(key string, n uint64) (uint64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(uint64)
+	rv, ok := value.Object.(uint64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an uint64", k)
+		return 0, fmt.Errorf("the value for %s is not an uint64", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type float32 by n. Returns an error if the item's value
 // is not an float32, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementFloat32(k string, n float32) (float32, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementFloat32(key string, n float32) (float32, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(float32)
+	rv, ok := value.Object.(float32)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an float32", k)
+		return 0, fmt.Errorf("the value for %s is not an float32", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Decrement an item of type float64 by n. Returns an error if the item's value
 // is not an float64, or if it was not found. If there is no error, the
 // decremented value is returned.
-func (c *cache) DecrementFloat64(k string, n float64) (float64, error) {
-	c.mu.Lock()
-	v, found := c.items[k]
-	if !found || v.Expired() {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("Item %s not found", k)
+func (c *cache) DecrementFloat64(key string, n float64) (float64, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	value, found := c.items[key]
+	if !found || value.Expired() {
+		return 0, fmt.Errorf("item %s not found", key)
 	}
-	rv, ok := v.Object.(float64)
+	rv, ok := value.Object.(float64)
 	if !ok {
-		c.mu.Unlock()
-		return 0, fmt.Errorf("The value for %s is not an float64", k)
+		return 0, fmt.Errorf("the value for %s is not an float64", key)
 	}
 	nv := rv - n
-	v.Object = nv
-	c.items[k] = v
-	c.mu.Unlock()
+	value.Object = nv
+	c.items[key] = value
+
 	return nv, nil
 }
 
 // Delete an item from the cache. Does nothing if the key is not in the cache.
-func (c *cache) Delete(k string) {
-	c.mu.Lock()
-	v, evicted := c.delete(k)
-	c.mu.Unlock()
+func (c *cache) Delete(key string) {
+	c.mutex.Lock()
+	value, evicted := c.delete(key)
+	c.mutex.Unlock()
+
 	if evicted {
-		c.onEvicted(k, v)
+		c.onEvicted(key, value)
 	}
 }
 
-func (c *cache) delete(k string) (interface{}, bool) {
+func (c *cache) delete(key string) (interface{}, bool) {
 	if c.onEvicted != nil {
-		if v, found := c.items[k]; found {
-			delete(c.items, k)
-			return v.Object, true
+		if value, found := c.items[key]; found {
+			delete(c.items, key)
+			return value.Object, true
 		}
 	}
-	delete(c.items, k)
+
+	delete(c.items, key)
+
 	return nil, false
 }
 
@@ -931,19 +939,21 @@ type keyAndValue struct {
 func (c *cache) DeleteExpired() {
 	var evictedItems []keyAndValue
 	now := time.Now().UnixNano()
-	c.mu.Lock()
-	for k, v := range c.items {
+
+	c.mutex.Lock()
+	for key, value := range c.items {
 		// "Inlining" of expired
-		if v.Expiration > 0 && now > v.Expiration {
-			ov, evicted := c.delete(k)
+		if value.Expiration > 0 && now > value.Expiration {
+			ov, evicted := c.delete(key)
 			if evicted {
-				evictedItems = append(evictedItems, keyAndValue{k, ov})
+				evictedItems = append(evictedItems, keyAndValue{key, ov})
 			}
 		}
 	}
-	c.mu.Unlock()
-	for _, v := range evictedItems {
-		c.onEvicted(v.key, v.value)
+	c.mutex.Unlock()
+
+	for _, value := range evictedItems {
+		c.onEvicted(value.key, value.value)
 	}
 }
 
@@ -951,9 +961,10 @@ func (c *cache) DeleteExpired() {
 // item is evicted from the cache. (Including when it is deleted manually, but
 // not when it is overwritten.) Set to nil to disable.
 func (c *cache) OnEvicted(f func(string, interface{})) {
-	c.mu.Lock()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	c.onEvicted = f
-	c.mu.Unlock()
 }
 
 // Write the cache's items (using Gob) to an io.Writer.
@@ -964,15 +975,18 @@ func (c *cache) Save(w io.Writer) (err error) {
 	enc := gob.NewEncoder(w)
 	defer func() {
 		if x := recover(); x != nil {
-			err = fmt.Errorf("Error registering item types with Gob library")
+			err = fmt.Errorf("error registering item types with Gob library")
 		}
 	}()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, v := range c.items {
-		gob.Register(v.Object)
+
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	for _, value := range c.items {
+		gob.Register(value.Object)
 	}
 	err = enc.Encode(&c.items)
+
 	return
 }
 
@@ -986,11 +1000,13 @@ func (c *cache) SaveFile(fname string) error {
 	if err != nil {
 		return err
 	}
+
 	err = c.Save(fp)
+	defer fp.Close()
 	if err != nil {
-		fp.Close()
 		return err
 	}
+
 	return fp.Close()
 }
 
@@ -1002,17 +1018,19 @@ func (c *cache) SaveFile(fname string) error {
 func (c *cache) Load(r io.Reader) error {
 	dec := gob.NewDecoder(r)
 	items := map[string]Item{}
+
 	err := dec.Decode(&items)
 	if err == nil {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		for k, v := range items {
-			ov, found := c.items[k]
+		c.mutex.Lock()
+		defer c.mutex.Unlock()
+		for key, value := range items {
+			ov, found := c.items[key]
 			if !found || ov.Expired() {
-				c.items[k] = v
+				c.items[key] = value
 			}
 		}
 	}
+
 	return err
 }
 
@@ -1026,46 +1044,51 @@ func (c *cache) LoadFile(fname string) error {
 	if err != nil {
 		return err
 	}
+
 	err = c.Load(fp)
+	defer fp.Close()
 	if err != nil {
-		fp.Close()
 		return err
 	}
+
 	return fp.Close()
 }
 
 // Copies all unexpired items in the cache into a new map and returns it.
 func (c *cache) Items() map[string]Item {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	m := make(map[string]Item, len(c.items))
 	now := time.Now().UnixNano()
-	for k, v := range c.items {
+	for key, value := range c.items {
 		// "Inlining" of Expired
-		if v.Expiration > 0 {
-			if now > v.Expiration {
+		if value.Expiration > 0 {
+			if now > value.Expiration {
 				continue
 			}
 		}
-		m[k] = v
+		m[key] = value
 	}
+
 	return m
 }
 
 // Returns the number of items in the cache. This may include items that have
 // expired, but have not yet been cleaned up.
 func (c *cache) ItemCount() int {
-	c.mu.RLock()
-	n := len(c.items)
-	c.mu.RUnlock()
-	return n
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return len(c.items)
 }
 
 // Delete all items from the cache.
 func (c *cache) Flush() {
-	c.mu.Lock()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	c.items = map[string]Item{}
-	c.mu.Unlock()
 }
 
 type janitor struct {
@@ -1096,17 +1119,20 @@ func runJanitor(c *cache, ci time.Duration) {
 		stop:     make(chan bool),
 	}
 	c.janitor = j
+
 	go j.Run(c)
 }
 
-func newCache(de time.Duration, m map[string]Item) *cache {
-	if de == 0 {
-		de = -1
+func newCache(duration time.Duration, items map[string]Item) *cache {
+	if duration == 0 {
+		duration = -1
 	}
+
 	c := &cache{
-		defaultExpiration: de,
-		items:             m,
+		expiration: duration,
+		items:      items,
 	}
+
 	return c
 }
 
@@ -1118,10 +1144,12 @@ func newCacheWithJanitor(de time.Duration, ci time.Duration, m map[string]Item) 
 	// garbage collected, the finalizer stops the janitor goroutine, after
 	// which c can be collected.
 	C := &Cache{c}
+
 	if ci > 0 {
 		runJanitor(c, ci)
 		runtime.SetFinalizer(C, stopJanitor)
 	}
+
 	return C
 }
 

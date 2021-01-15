@@ -170,8 +170,8 @@ func newShardedCache(n int, de time.Duration) *shardedCache {
 	}
 	for i := 0; i < n; i++ {
 		c := &cache{
-			defaultExpiration: de,
-			items:             map[string]Item{},
+			expiration: de,
+			items:      map[string]Item{},
 		}
 		sc.cs[i] = c
 	}

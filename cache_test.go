@@ -1633,10 +1633,10 @@ func BenchmarkCacheSetDeleteSingleLock(b *testing.B) {
 	tc := New(DefaultExpiration, 0)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		tc.mu.Lock()
+		tc.mutex.Lock()
 		tc.set("foo", "bar", DefaultExpiration)
 		tc.delete("foo")
-		tc.mu.Unlock()
+		tc.mutex.Unlock()
 	}
 }
 
@@ -1666,11 +1666,11 @@ func BenchmarkIncrementInt(b *testing.B) {
 func BenchmarkDeleteExpiredLoop(b *testing.B) {
 	b.StopTimer()
 	tc := New(5*time.Minute, 0)
-	tc.mu.Lock()
+	tc.mutex.Lock()
 	for i := 0; i < 100000; i++ {
 		tc.set(strconv.Itoa(i), "bar", DefaultExpiration)
 	}
-	tc.mu.Unlock()
+	tc.mutex.Unlock()
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
 		tc.DeleteExpired()
